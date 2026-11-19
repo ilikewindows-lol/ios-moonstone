@@ -2,10 +2,15 @@
  * Milestone 4: act as iBoot for xnu.
  *
  * mkpayload.py already resolved the kernel's chained fixups and built the
- * ADT, so this only has to: find the payload in the ABL ramdisk, copy the
- * segments to phys_base + (vmaddr - virt_base), place the ADT and
- * boot_args behind the kernel, and jump to the entry point with the MMU
- * and caches off, x0 = boot_args (physical).
+ * ADT, so this only has to: find the payload (appended to the shim's own
+ * Image, or in the ABL ramdisk), copy the segments to
+ * phys_base + (vmaddr - virt_base), place the ADT and boot_args behind the
+ * kernel, and jump to the entry point with the MMU and caches off,
+ * x0 = boot_args (physical).
+ *
+ * moonstone: the Xiaomi ABL boots a v3 boot image whose ramdisk it may drop
+ * or replace with vendor_boot's, so the payload rides behind the shim in the
+ * kernel Image (same approach as ios-topaz).
  */
 #include <stdint.h>
 #include "console.h"
@@ -76,18 +81,56 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* build.sh appends the payload to the Image at the first 4K boundary after _end */
+extern char _end[];
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-		return "no initrd in /chosen";
-	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	/*
+	 * The payload rides behind the shim in the kernel Image. Its exact
+	 * size is unknown here; the kernel memory check below only needs an
+	 * upper bound, and the Image is far below phys_base.
+	 */
+	if (magic_ok((const char *)emb)) {
+		rd_start = emb;
+		rd_end = emb + 0x8000000;
+		con_hex("EMBED", emb);
+	} else {
+		if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+		    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
+			return "no payload: no embed, no initrd in /chosen";
+		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	}
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	/*
+	 * If the payload came in through a ramdisk, ABL may have concatenated
+	 * other ramdisks in front of it, so it is somewhere inside the initrd
+	 * and not necessarily 8-byte aligned. Find it and move it down to an
+	 * aligned address.
+	 */
+	uintptr_t hit = 0;
+	for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
+		if (magic_ok((const char *)a)) {
+			hit = a;
+			break;
+		}
+	if (!hit)
 		return "no SWEETXNU payload";
+	if (hit != rd_start) {
+		uintptr_t dst = (rd_start + 7) & ~7UL;
+		volatile uint8_t *d = (volatile uint8_t *)dst;
+		volatile const uint8_t *src = (volatile const uint8_t *)hit;
+
+		con_hex2("PAYLOAD", "at=", hit, "to=", dst);
+		for (uint64_t i = 0; i < rd_end - hit; i++)
+			d[i] = src[i];
+		rd_end = dst + (rd_end - hit);
+		rd_start = dst;
+	}
+	const struct payload *p = (const struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 

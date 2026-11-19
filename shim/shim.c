@@ -12,12 +12,12 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 + restart_reason@65c (moonstone) */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			0x0440b000UL	/* restart@440b000 qcom,pshold (moonstone) */
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
+#define GICD_BASE		0x0f200000UL	/* moonstone: arm,gic-v3 reg <0xf200000 0x10000 0xf240000 0x100000> */
+#define GICR_BASE		0x0f240000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
