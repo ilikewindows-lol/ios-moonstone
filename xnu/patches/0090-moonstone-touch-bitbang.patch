@@ -1,0 +1,484 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -20,7 +20,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+-void sweet_touch_init(void);
++void sweet_touch_init_sweet(void); /* SM7150 driver, unused on moonstone */
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -636,7 +636,7 @@
+ }
+ 
+ void
+-sweet_touch_init(void)
++sweet_touch_init_sweet(void)
+ {
+ 	int enabled = 1;
+ 	thread_t thread;
+--- /dev/null
++++ b/bsd/dev/moon_touch.c
+@@ -0,0 +1,461 @@
++/*
++ * moonstone (POCO X5 5G, SM6375) touch: FocalTech FT5452 (chip id 0x54 at
++ * register 0xA3) at I2C address 0x38 on GPIO19 (SDA) / GPIO20 (SCL), reset on
++ * GPIO21 (active low), interrupt on GPIO22, panel/touch power enable on GPIO49.
++ *
++ * The serial engine behind GPIO19/20 (SE8) has its FIFO interface hardware
++ * disabled (GENI_IF_DISABLE_RO bit0): only the GPI DMA engine can drive it. So
++ * the bus is bit-banged on the TLMM pins. That needs no clock votes, no RPMh
++ * and no GENI setup. The board's pull-ups are strong, so open-drain emulation
++ * works: low = output enable with a zero latch, high = release the pad.
++ *
++ * Call once after the scheduler is running; all work runs on one thread.
++ * Derived from the sweet SE7 FIFO driver; the FocalTech report parser keeps its
++ * validation but scales the raw sensor range to the panel instead of rejecting
++ * it. See touch2/report.md for the report layout.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_init(void);
++
++/* TLMM pin n config register = base + 0x1000 * n (flat layout), +4 = in/out. */
++#define TOUCH_TLMM_PA     0x00500000u
++#define TOUCH_TLMM_SIZE   0x00040000u
++#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
++#define TOUCH_PIN_SDA     19u
++#define TOUCH_PIN_SCL     20u
++#define TOUCH_PIN_RST     21u
++#define TOUCH_PIN_IRQ     22u
++#define TOUCH_PIN_AVDD    49u
++#define TOUCH_ADDR        0x38u
++#define TOUCH_MAX         10u
++#define TOUCH_BB_US       2
++
++/* Panel size, and the raw range the sensor reports (positions 0..RAW-1). */
++#define TOUCH_PANEL_W     1080u
++#define TOUCH_PANEL_H     2400u
++#ifndef TOUCH_RAW_W
++#define TOUCH_RAW_W       1080u
++#endif
++#ifndef TOUCH_RAW_H
++#define TOUCH_RAW_H       2400u
++#endif
++
++static struct {
++	vm_offset_t gpio;
++	bool started, dead, stuck;
++	int irq_hint;
++	uint32_t active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++} st;
++static int touch_sleep_chan;
++/* Runtime raw range, boot-args sweettouchw / sweettouchh (default: panel size). */
++static unsigned touch_raw_w = TOUCH_RAW_W, touch_raw_h = TOUCH_RAW_H;
++
++static uint32_t
++touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	uint32_t cfg = touch_rd(st.gpio, off);
++	if (out) {
++		/* Set the desired latch before enabling output (reset is active low). */
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	touch_wr(st.gpio, off, cfg);
++}
++
++/* ---- software I2C: open drain by toggling the output enable ---- */
++
++static void
++touch_sda(bool hi)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SDA), hi ? 0u : 0x200u);
++}
++
++static void
++touch_scl(bool hi)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SCL), hi ? 0u : 0x200u);
++}
++
++static bool
++touch_sda_get(void)
++{
++	return (touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SDA)) & 1u) != 0;
++}
++
++static bool
++touch_scl_get(void)
++{
++	return (touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SCL)) & 1u) != 0;
++}
++
++/* Honour clock stretching, but never hang on a held bus. */
++static void
++touch_scl_wait(void)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (touch_scl_get()) {
++			return;
++		}
++		delay(1);
++	}
++	st.stuck = true;
++}
++
++static void
++touch_bus_init(void)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SDA), 0); /* latch 0, then only toggle OE */
++	touch_wr(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SCL), 0);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SDA), 0); /* GPIO, no pull, 2 mA, released */
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SCL), 0);
++	delay(50);
++}
++
++static void
++touch_start(void)
++{
++	touch_sda(true);
++	delay(TOUCH_BB_US);
++	touch_scl(true);
++	touch_scl_wait();
++	delay(TOUCH_BB_US);
++	touch_sda(false);
++	delay(TOUCH_BB_US);
++	touch_scl(false);
++	delay(TOUCH_BB_US);
++}
++
++static void
++touch_stop(void)
++{
++	touch_sda(false);
++	delay(TOUCH_BB_US);
++	touch_scl(true);
++	touch_scl_wait();
++	delay(TOUCH_BB_US);
++	touch_sda(true);
++	delay(TOUCH_BB_US);
++}
++
++/* Returns true if the slave ACKed. */
++static bool
++touch_wbyte(uint8_t b)
++{
++	for (int i = 7; i >= 0; --i) {
++		touch_sda(((b >> i) & 1) != 0);
++		delay(TOUCH_BB_US);
++		touch_scl(true);
++		touch_scl_wait();
++		delay(TOUCH_BB_US);
++		touch_scl(false);
++		delay(TOUCH_BB_US);
++	}
++	touch_sda(true); /* release for the ACK bit */
++	delay(TOUCH_BB_US);
++	touch_scl(true);
++	touch_scl_wait();
++	delay(TOUCH_BB_US);
++	bool ack = !touch_sda_get();
++	touch_scl(false);
++	delay(TOUCH_BB_US);
++	return ack;
++}
++
++static uint8_t
++touch_rbyte(bool ack)
++{
++	uint8_t v = 0;
++	touch_sda(true);
++	for (unsigned i = 0; i < 8; ++i) {
++		delay(TOUCH_BB_US);
++		touch_scl(true);
++		touch_scl_wait();
++		delay(TOUCH_BB_US);
++		v = (uint8_t)((v << 1) | (touch_sda_get() ? 1u : 0u));
++		touch_scl(false);
++		delay(TOUCH_BB_US);
++	}
++	touch_sda(!ack);
++	delay(TOUCH_BB_US);
++	touch_scl(true);
++	touch_scl_wait();
++	delay(TOUCH_BB_US);
++	touch_scl(false);
++	delay(TOUCH_BB_US);
++	touch_sda(true);
++	return v;
++}
++
++/* A slave left mid-byte can hold SDA low: clock it out, then STOP. */
++static void
++touch_recover(void)
++{
++	touch_sda(true);
++	for (unsigned i = 0; i < 9; ++i) {
++		touch_scl(false);
++		delay(TOUCH_BB_US);
++		touch_scl(true);
++		touch_scl_wait();
++		delay(TOUCH_BB_US);
++		if (touch_sda_get()) {
++			break;
++		}
++	}
++	touch_stop();
++}
++
++/* Register pointer write, repeated START, read len bytes. */
++static int
++touch_read(uint8_t reg, uint8_t *buf, unsigned len)
++{
++	int err = 0;
++	st.stuck = false;
++	touch_start();
++	if (!touch_wbyte((uint8_t)(TOUCH_ADDR << 1))) {
++		err = ENXIO;
++	} else if (!touch_wbyte(reg)) {
++		err = EIO;
++	} else {
++		touch_start(); /* repeated START: SCL is low here */
++		if (!touch_wbyte((uint8_t)((TOUCH_ADDR << 1) | 1u))) {
++			err = ENXIO;
++		} else {
++			for (unsigned i = 0; i < len; ++i) {
++				buf[i] = touch_rbyte(i + 1 < len);
++			}
++		}
++	}
++	touch_stop();
++	if (!err && st.stuck) {
++		err = ETIMEDOUT;
++	}
++	if (err == ETIMEDOUT) {
++		touch_recover();
++	}
++	return err;
++}
++
++/* Raw sensor position -> panel pixel, clamped to the panel. */
++static int
++touch_scale(unsigned raw, unsigned raw_range, unsigned panel)
++{
++	unsigned v = (unsigned)(((uint64_t)raw * panel) / raw_range);
++	return (int)(v >= panel ? panel - 1u : v);
++}
++
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++touch_focaltech(void)
++{
++	uint8_t buf[63];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0, seen = 0;
++	int err;
++	if (!st.active) {
++		/* Idle fast path: three bytes say whether anything is touching. The
++		 * chip reports 0x00 or the 0xff fill pattern in the count byte. */
++		err = touch_read(0, buf, 3);
++		if (err) {
++			return err;
++		}
++		if (buf[2] == 0 || buf[2] == 0xffu) {
++			return 0;
++		}
++	}
++	err = touch_read(0, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	unsigned n = buf[2] == 0xffu ? 0u : (buf[2] & 15u), active = 0;
++	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *p = buf + 3u + 6u * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= TOUCH_MAX) {
++			break; /* vendor's unused-record sentinel */
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u) {
++			continue; /* UP record */
++		}
++		if (event == 3u) {
++			return EIO;
++		}
++		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		mask |= 1u << id;
++		x[id] = touch_scale(px, touch_raw_w, TOUCH_PANEL_W);
++		y[id] = touch_scale(py, touch_raw_h, TOUCH_PANEL_H);
++		++active;
++	}
++	if (active != n) {
++		return EIO;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 15;
++	(void)arg;
++	(void)result;
++	/* Boot-arg sweettouchdelay (seconds) lets the GUI come up first. */
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET TOUCH: starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++	st.gpio = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
++	if (!st.gpio) {
++		printf("SWEET TOUCH: TLMM mapping failed\n");
++		goto out;
++	}
++	printf("SWEET TOUCH: TLMM avdd=%#x rst=%#x irq=%#x sda=%#x scl=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_AVDD)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_RST)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SDA)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_SCL)));
++	/* Power sequence proven on the phone: irq input pull-up, power enable,
++	 * settle, release reset (active low), wait for the chip to boot. */
++	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);
++	touch_gpio(TOUCH_PIN_AVDD, 0, 0, 0, true, true);
++	touch_wait(10);
++	touch_gpio(TOUCH_PIN_RST, 0, 3, 3, true, true);
++	touch_wait(300);
++	touch_bus_init();
++	touch_recover();
++	uint8_t id[4] = {0xee, 0xee, 0xee, 0xee};
++	int e1 = touch_read(0xa3, &id[0], 1);
++	int e2 = touch_read(0x9f, &id[1], 1);
++	int e3 = touch_read(0xa6, &id[2], 1);
++	printf("SWEET TOUCH: chip a3=%02x 9f=%02x a6=%02x err=%d/%d/%d\n",
++	    id[0], id[1], id[2], e1, e2, e3);
++	if (e1 || id[0] != 0x54) {
++		printf("SWEET TOUCH: FocalTech 0x54 not found; stopping\n");
++		goto out;
++	}
++	printf("SWEET TOUCH: Focaltech %02x:%02x, software I2C, raw %ux%u -> %ux%u, poll=10ms\n",
++	    id[0], id[1], touch_raw_w, touch_raw_h, TOUCH_PANEL_W, TOUCH_PANEL_H);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		/* Optional IRQ hint still reads every 100ms, and always while down. */
++		if (!st.irq_hint || st.active ||
++		    !(touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
++		    (++ticks % 10u) == 0) {
++			int err = touch_focaltech();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH: report err=%d\n", err);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweettouchw", &touch_raw_w, sizeof(touch_raw_w));
++	(void)PE_parse_boot_argn("sweettouchh", &touch_raw_h, sizeof(touch_raw_h));
++	if (touch_raw_w < 64u || touch_raw_w > 4096u) {
++		touch_raw_w = TOUCH_RAW_W;
++	}
++	if (touch_raw_h < 64u || touch_raw_h > 4096u) {
++		touch_raw_h = TOUCH_RAW_H;
++	}
++	if (!enabled) {
++		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
