@@ -1,0 +1,162 @@
+################ 0113-topaz-modem-pas-boot.patch
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
++extern "C" void topaz_modem_init(void);             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+@@ -252,6 +253,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	topaz_modem_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+-- 
+2.43.0
+################ 0114-topaz-iphonex-canvas-aligned.patch
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -271,7 +271,8 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
++	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -835,6 +836,10 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+ 		uint32_t ox = (s->width - fWidth) / 2, oy = (s->height - fHeight) / 2;
++		if (s->width == fLogicalW && s->height == fLogicalH) {
++			ox = (uint32_t)fOffX;
++			oy = (uint32_t)fOffY;
++		}
+ 		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
+ 			uintptr_t va = s->kernelAddress();
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -436,7 +436,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
++	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-- 
+2.43.0
+################ 0120-topaz-console-only.patch
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -879,7 +879,17 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	static int console_only = -1;
+ 
++	/* boot-arg sweetfb_console=1: debugging, the panel keeps showing the kernel console */
++	if (console_only < 0) {
++		console_only = 0;
++		PE_parse_boot_argn("sweetfb_console", &console_only, sizeof(console_only));
++	}
++	if (console_only > 0 && fConsShown) {
++		(void)mask;
++		return;
++	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {
+-- 
+2.43.0
+
+################ small TopazModem hunks 0116 0117 0119
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -500,9 +500,7 @@ modem_boot(void)
+ 	}
+ 	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
+ 	LOG("PAS id %u supported: ret=%llx res=%llx", PAS_ID_MODEM, st, res);
+-	if (st != 0 || res != 1) {
+-		return false;
+-	}
++	/* informational only: on topaz TZ answers res=0 here, init_image decides */
+ 
+ 	mdt_size = fw_size("modem.mdt");
+ 	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
+-- 
+2.43.0
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -542,12 +542,23 @@ modem_boot(void)
+ 		uint64_t hdr = eh->e_phoff + eh->e_phnum * sizeof(struct elf32_phdr);
+ 		uint64_t meta_size = hdr + ph[hash].p_filesz;
+ 		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
+-		if (meta == NULL || ph[hash].p_offset + ph[hash].p_filesz > (uint64_t)mdt_size) {
+-			LOG("metadata: alloc or split hash segment not supported");
++		if (meta == NULL) {
++			LOG("metadata: pool allocation of %llu bytes failed", meta_size);
+ 			goto out;
+ 		}
+ 		memcpy(meta, mdt, hdr);
+-		memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		if (ph[hash].p_offset + ph[hash].p_filesz <= (uint64_t)mdt_size) {
++			memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		} else {
++			/* split firmware: the hash segment is its own .bNN file (qcom_mdt_read_metadata) */
++			char hname[16];
++			snprintf(hname, sizeof(hname), "modem.b%02u", hash);
++			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
++			LOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
++			if (got != (int64_t)ph[hash].p_filesz) {
++				goto out;
++			}
++		}
+ 		mb();
+ 
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
+-- 
+2.43.0
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -740,6 +740,8 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, c->b, c->c, c->d);
++		} else if (c->a != 0) {
++			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -1007,6 +1009,9 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (glink) {
+ 			glink_poll(part, ms);
+ 		}
++		if (glink && ms == 3000) {
++			glink_summary();                /* early, before the iOS UI covers the console */
++		}
+ 		if (in == NULL) {
+ 			uint32_t sz = 0;
+ 			in = (struct smp2p_hdr *)smem_get(part, ITEM_SMP2P_IN, &sz);
+-- 
+2.43.0
